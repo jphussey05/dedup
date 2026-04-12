@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import imagehash
 from PIL import Image
+
+Image.MAX_IMAGE_PIXELS = 500_000_000
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
 from dedup.db import Database
