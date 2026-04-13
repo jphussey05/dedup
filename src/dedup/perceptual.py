@@ -46,9 +46,13 @@ def _compute_hashes_worker(
     Image.MAX_IMAGE_PIXELS = 500_000_000
     try:
         with Image.open(path) as img:
-            img_rgb = img.convert("RGB")
-            ph = imagehash.phash(img_rgb, hash_size=8)
-            dh = imagehash.dhash(img_rgb, hash_size=8)
+            # Resize to 256x256 before hashing to cap memory usage.
+            # pHash/dHash internally reduce to 8x8 or 9x8 anyway,
+            # so this doesn't affect hash quality.
+            img_small = img.convert("RGB").resize((256, 256), Image.LANCZOS)
+            ph = imagehash.phash(img_small, hash_size=8)
+            dh = imagehash.dhash(img_small, hash_size=8)
+            del img_small
 
         ph_hex = str(ph)
         dh_hex = str(dh)
@@ -75,7 +79,7 @@ def compute_perceptual_hashes(
         return
 
     if workers is None:
-        workers = max(1, (os.cpu_count() or 4) - 1)
+        workers = max(1, (os.cpu_count() or 4) // 2)
 
     total = len(images)
     console.print(
