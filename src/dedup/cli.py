@@ -68,6 +68,7 @@ def phash(
     db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
     algorithm: str = typer.Option("both", help="Hash algorithm: phash, dhash, or both"),
     threshold: int = typer.Option(10, help="Max Hamming distance for a match"),
+    workers: int = typer.Option(0, help="CPU workers (0 = auto: cpu_count - 1)"),
 ) -> None:
     """Compute perceptual hashes and find near-duplicate images."""
     from dedup.comparator import find_perceptual_duplicates
@@ -75,7 +76,7 @@ def phash(
 
     database = get_db(db)
     try:
-        compute_perceptual_hashes(database)
+        compute_perceptual_hashes(database, workers=workers if workers > 0 else None)
         find_perceptual_duplicates(database, threshold)
     finally:
         database.close()
