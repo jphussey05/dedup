@@ -8,14 +8,14 @@ from pathlib import Path
 
 from PIL import Image
 from rich.live import Live
-
-# Raise Pillow's decompression bomb limit for trusted local/NAS files.
-# Default is ~89MP which is easily exceeded by large TIFFs and scanned photos.
-Image.MAX_IMAGE_PIXELS = 500_000_000  # 500 megapixels
 from rich.table import Table
 
 from dedup.db import Database
 from dedup.pathutil import normalize_path
+
+# Raise Pillow's decompression bomb limit for trusted local/NAS files.
+# Default is ~89MP which is easily exceeded by large TIFFs and scanned photos.
+Image.MAX_IMAGE_PIXELS = 500_000_000  # 500 megapixels
 
 
 def _extract_exif_date(img: Image.Image) -> str | None:
