@@ -127,6 +127,62 @@ def _render_json(rows: list[dict], output: Path | None) -> None:
         print(text)
 
 
+def generate_error_report(
+    db: Database,
+    limit: int = 50,
+    stage: str = "all",
+    export: Path | None = None,
+) -> None:
+    """Show files that failed processing and why."""
+    console = Console()
+
+    rows = db.get_errored_images(stage=stage, limit=limit)
+
+    if not rows:
+        console.print("[green]No errors found.[/green]")
+        return
+
+    # Group errors by message to show common patterns first
+    from collections import Counter
+    error_counts = Counter(r["error"] for r in rows)
+
+    console.print(f"\n[bold red]{len(rows)} errored files[/bold red] (showing up to {limit})\n")
+
+    # Show top error patterns
+    console.print("[bold]Most common errors:[/bold]")
+    for msg, count in error_counts.most_common(5):
+        short = msg[:80] + "..." if len(msg) > 80 else msg
+        console.print(f"  [yellow]{count}x[/yellow] {short}")
+
+    console.print()
+
+    # Show individual files
+    table = Table(show_lines=False, box=None)
+    table.add_column("File", max_width=60)
+    table.add_column("Size", justify="right", width=10)
+    table.add_column("Error", max_width=60)
+
+    for row in rows:
+        size_str = _format_size(row["file_size"])
+        error = row["error"] or ""
+        short_error = error[:60] + "..." if len(error) > 60 else error
+        table.add_row(row["path"], size_str, f"[yellow]{short_error}[/yellow]")
+
+    console.print(table)
+
+    if export:
+        import csv as csv_mod
+        with open(export, "w", newline="", encoding="utf-8") as f:
+            writer = csv_mod.DictWriter(
+                f,
+                fieldnames=["id", "path", "filename", "file_size", "error"],
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        console.print(f"\n[green]Exported to {export}[/green]")
+
+
 def _format_size(size: int) -> str:
     """Format file size in human-readable form."""
     if size >= 1024 * 1024:

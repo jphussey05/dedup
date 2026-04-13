@@ -313,6 +313,30 @@ class Database:
 
         return [dict(r) for r in rows]
 
+    def get_errored_images(self, stage: str = "all", limit: int = 50) -> list[dict[str, Any]]:
+        """Get images that have errors, optionally filtered by which stage errored."""
+        # Stage is inferred from which columns are NULL alongside the error
+        stage_filters = {
+            "hash": "sha256 IS NULL AND phash IS NULL AND embedding IS NULL",
+            "phash": "sha256 IS NOT NULL AND phash IS NULL AND embedding IS NULL",
+            "embed": "phash IS NOT NULL AND embedding IS NULL",
+            "scan": "sha256 IS NULL AND phash IS NULL AND embedding IS NULL",
+        }
+
+        where = "error IS NOT NULL"
+        if stage != "all" and stage in stage_filters:
+            where += f" AND {stage_filters[stage]}"
+
+        rows = self.conn.execute(
+            f"""SELECT id, path, filename, file_size, error,
+                       sha256, phash, embedding,
+                       scanned_at, hashed_at, phashed_at, embedded_at
+                FROM images WHERE {where}
+                ORDER BY scanned_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_status(self) -> dict[str, Any]:
         """Get current processing status counts."""
         total = self.conn.execute("SELECT COUNT(*) as n FROM images").fetchone()["n"]

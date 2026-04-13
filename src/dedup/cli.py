@@ -127,6 +127,23 @@ def report(
 
 
 @app.command()
+def errors(
+    db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
+    limit: int = typer.Option(50, help="Max errors to show"),
+    stage: str = typer.Option("all", help="Filter by stage: scan, hash, phash, embed, all"),
+    export: Path | None = typer.Option(None, "--export", "-o", help="Export error list to CSV"),
+) -> None:
+    """Show files that failed processing and why."""
+    from dedup.reporter import generate_error_report
+
+    database = get_db(db)
+    try:
+        generate_error_report(database, limit, stage, export)
+    finally:
+        database.close()
+
+
+@app.command()
 def status(
     db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
 ) -> None:
