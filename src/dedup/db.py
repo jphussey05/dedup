@@ -94,6 +94,7 @@ class Database:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute("PRAGMA wal_autocheckpoint = 10000")  # ~40 MB between checkpoints
         return self._conn
 
     def init_schema(self) -> None:
@@ -234,10 +235,31 @@ class Database:
             (embedding_blob, image_id),
         )
 
-    def get_all_embeddings(self) -> list[sqlite3.Row]:
+    def update_embeddings_batch(self, updates: list[tuple[bytes, int]]) -> None:
+        """Batch-update embeddings using executemany (one round-trip per batch)."""
+        self.conn.executemany(
+            "UPDATE images SET embedding = ?, embedded_at = datetime('now') WHERE id = ?",
+            updates,
+        )
+
+    def get_embeddings_count(self) -> int:
         return self.conn.execute(
+            "SELECT COUNT(*) FROM images WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+
+    def get_all_embeddings(self, chunk_size: int = 5000) -> Generator[sqlite3.Row, None, None]:
+        cursor = self.conn.execute(
             "SELECT id, embedding FROM images WHERE embedding IS NOT NULL"
-        ).fetchall()
+        )
+        while True:
+            rows = cursor.fetchmany(chunk_size)
+            if not rows:
+                break
+            yield from rows
+
+    def checkpoint(self) -> None:
+        """Force a full WAL checkpoint and truncate the WAL file."""
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # --- Duplicate group operations ---
 
@@ -268,6 +290,58 @@ class Database:
                VALUES (?, ?, ?, ?)""",
             (group_id, image_id_1, image_id_2, similarity),
         )
+
+    def get_duplicate_groups(
+        self, match_type: str = "all", min_confidence: float = 0.0
+    ) -> list[sqlite3.Row]:
+        """Return duplicate group rows, optionally filtered by match_type."""
+        if match_type == "all":
+            return self.conn.execute(
+                """SELECT id, match_type, confidence, image_count
+                   FROM duplicate_groups
+                   WHERE confidence >= ?
+                   ORDER BY match_type, id""",
+                (min_confidence,),
+            ).fetchall()
+        return self.conn.execute(
+            """SELECT id, match_type, confidence, image_count
+               FROM duplicate_groups
+               WHERE match_type = ? AND confidence >= ?
+               ORDER BY id""",
+            (match_type, min_confidence),
+        ).fetchall()
+
+    def get_group_members(self, group_id: int) -> list[sqlite3.Row]:
+        """Return every image row participating in the given duplicate group."""
+        return self.conn.execute(
+            """SELECT DISTINCT i.id, i.path, i.filename, i.file_size,
+                      i.width, i.height, i.exif_date, i.file_mtime
+               FROM images i
+               JOIN duplicate_pairs dp
+                 ON (i.id = dp.image_id_1 OR i.id = dp.image_id_2)
+               WHERE dp.group_id = ?""",
+            (group_id,),
+        ).fetchall()
+
+    def delete_images(self, image_ids: list[int]) -> None:
+        """Remove image rows by id. Pairs cascade; groups cleaned up separately."""
+        if not image_ids:
+            return
+        self.conn.executemany(
+            "DELETE FROM images WHERE id = ?",
+            [(i,) for i in image_ids],
+        )
+
+    def cleanup_stale_groups(self) -> int:
+        """Delete duplicate_groups that have fewer than 2 remaining pairs.
+
+        Returns number of groups removed.
+        """
+        cursor = self.conn.execute(
+            """DELETE FROM duplicate_groups
+               WHERE id NOT IN (SELECT DISTINCT group_id FROM duplicate_pairs)"""
+        )
+        return cursor.rowcount
 
     def get_exact_duplicates(self) -> list[sqlite3.Row]:
         """Get SHA256 values that appear more than once."""

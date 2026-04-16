@@ -79,9 +79,12 @@ def compute_embeddings(
                         normalize_embeddings=True,
                     )
 
-                    for row, emb in zip(valid_rows, embeddings):
-                        blob = np.array(emb, dtype=np.float32).tobytes()
-                        db.update_embedding(row["id"], blob)
+                    batch_updates = [
+                        (np.array(emb, dtype=np.float32).tobytes(), row["id"])
+                        for row, emb in zip(valid_rows, embeddings)
+                    ]
+                    db.update_embeddings_batch(batch_updates)
+                    for _ in batch_updates:
                         progress.advance(task)
 
                 except Exception as e:
@@ -96,6 +99,7 @@ def compute_embeddings(
 
             db.conn.commit()
 
+    db.checkpoint()
     console.print(f"[green]Done![/green] Computed embeddings for {len(images) - errors} images")
     if errors:
         console.print(f"[yellow]{errors} errors[/yellow]")

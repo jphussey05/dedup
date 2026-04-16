@@ -182,8 +182,7 @@ def find_cnn_duplicates(db: Database, threshold: float = 0.92) -> None:
 
     db.clear_groups("cnn")
 
-    all_embeddings = db.get_all_embeddings()
-    n = len(all_embeddings)
+    n = db.get_embeddings_count()
 
     if n == 0:
         console.print("[dim]No embeddings computed yet.[/dim]")
@@ -191,23 +190,45 @@ def find_cnn_duplicates(db: Database, threshold: float = 0.92) -> None:
 
     console.print(f"[bold]Comparing {n} embeddings[/bold] (threshold={threshold})")
 
-    ids = [row["id"] for row in all_embeddings]
-    embeddings = np.array(
-        [np.frombuffer(row["embedding"], dtype=np.float32) for row in all_embeddings]
-    )
+    # Determine embedding dimension from the first row without holding all rows in memory
+    first_row = next(iter(db.get_all_embeddings()))
+    dim = len(np.frombuffer(first_row["embedding"], dtype=np.float32))
+
+    # Stream embeddings into a pre-allocated array to avoid holding sqlite3.Row objects
+    ids: list[int] = []
+    embeddings = np.empty((n, dim), dtype=np.float32)
+    for i, row in enumerate(db.get_all_embeddings()):
+        ids.append(row["id"])
+        embeddings[i] = np.frombuffer(row["embedding"], dtype=np.float32)
 
     # Use FAISS for efficient similarity search
     try:
         import faiss
 
-        dim = embeddings.shape[1]
         index = faiss.IndexFlatIP(dim)  # Inner product = cosine similarity on L2-normalized vectors
         index.add(embeddings)
 
         k = min(50, n)  # Search for top-50 neighbors
-        similarities, indices = index.search(embeddings, k)
+        # Chunk the search to limit peak result-matrix memory
+        search_chunk = 10_000
+        all_sims = []
+        all_idxs = []
+        for start in range(0, n, search_chunk):
+            chunk = embeddings[start : start + search_chunk]
+            s, ix = index.search(chunk, k)
+            all_sims.append(s)
+            all_idxs.append(ix)
+        similarities = np.vstack(all_sims)
+        indices = np.vstack(all_idxs)
     except ImportError:
         # Fallback to numpy if FAISS not available
+        if n > 50_000:
+            console.print(
+                f"[red]FAISS is not installed and {n:,} embeddings is too large for the "
+                f"numpy fallback (would require ~{n * n * 4 // 1_073_741_824:.0f} GB RAM). "
+                "Install faiss-cpu: pip install faiss-cpu[/red]"
+            )
+            return
         console.print("[yellow]FAISS not installed, using numpy (slower).[/yellow]")
         similarities_matrix = embeddings @ embeddings.T
         k = min(50, n)

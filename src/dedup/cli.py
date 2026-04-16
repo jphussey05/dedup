@@ -128,6 +128,80 @@ def report(
 
 
 @app.command()
+def review(
+    db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
+    match_type: str = typer.Option(
+        "exact",
+        help="Which groups to process: exact, perceptual, cnn, or all. "
+             "Default 'exact' is the only risk-free auto-delete (SHA256 match).",
+    ),
+    min_confidence: float = typer.Option(0.0, help="Minimum confidence score"),
+    export: Path | None = typer.Option(
+        None, "--export", "-o", help="Write deletion plan to CSV"
+    ),
+    execute: bool = typer.Option(
+        False, "--execute", help="Actually delete files (otherwise preview only)"
+    ),
+    use_trash: bool = typer.Option(
+        True,
+        "--trash/--no-trash",
+        help="Send files to Recycle Bin (default) or permanently delete",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip confirmation prompt when executing"
+    ),
+    limit: int | None = typer.Option(
+        None, help="Only process the first N groups (useful for testing)"
+    ),
+) -> None:
+    """Pick a keeper per duplicate group and preview or delete the rest.
+
+    Scoring priority: EXIF present > shallowest path > largest size > oldest mtime.
+    Default is preview only; pass --execute to delete.
+    """
+    from dedup.deleter import execute_deletions, export_plan, plan_deletions, preview_deletions
+
+    database = get_db(db)
+    try:
+        decisions = plan_deletions(database, match_type, min_confidence, limit)
+
+        if not decisions:
+            console.print("[dim]No duplicate groups matched the filter.[/dim]")
+            return
+
+        preview_deletions(decisions, console)
+
+        if export:
+            export_plan(decisions, export)
+            console.print(f"[green]Wrote deletion plan to {export}[/green]")
+
+        if not execute:
+            console.print(
+                "\n[dim]Preview only. Re-run with [bold]--execute[/bold] to delete.[/dim]"
+            )
+            return
+
+        total = sum(len(d.deletions) for d in decisions)
+        mode = "Recycle Bin" if use_trash else "[red]PERMANENT DELETE[/red]"
+        console.print(f"\nAbout to delete [bold]{total}[/bold] files via {mode}.")
+
+        if not yes:
+            confirm = typer.confirm("Proceed?", default=False)
+            if not confirm:
+                console.print("[yellow]Aborted.[/yellow]")
+                return
+
+        deleted, errs, freed = execute_deletions(database, decisions, use_trash, console)
+        freed_mb = freed / 1024 / 1024
+        console.print(
+            f"[green]Deleted {deleted} files[/green] "
+            f"({freed_mb:.1f} MB freed){f', [red]{errs} errors[/red]' if errs else ''}"
+        )
+    finally:
+        database.close()
+
+
+@app.command()
 def errors(
     db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
     limit: int = typer.Option(50, help="Max errors to show"),
