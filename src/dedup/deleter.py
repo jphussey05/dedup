@@ -217,12 +217,21 @@ def execute_deletions(
                 size = victim["file_size"] or 0
                 try:
                     deleter_fn(path)
+                    # Verify the file is actually gone — send2trash can raise
+                    # FileNotFoundError on mangled UNC paths without deleting.
+                    if Path(path).exists():
+                        raise OSError(f"delete returned OK but file still on disk: {path}")
                     deleted_count += 1
                     freed_bytes += size
                     deleted_ids.append(victim["id"])
                 except FileNotFoundError:
-                    # File already gone — still drop from DB
-                    deleted_ids.append(victim["id"])
+                    if Path(path).exists():
+                        # File is still there — the path was garbled, not missing
+                        error_count += 1
+                        console.print(f"[red]Failed:[/red] {path} (path rejected)")
+                    else:
+                        # File genuinely gone already — clean DB row
+                        deleted_ids.append(victim["id"])
                 except Exception as exc:
                     error_count += 1
                     console.print(f"[red]Failed:[/red] {path} ({exc})")
@@ -238,11 +247,20 @@ def execute_deletions(
     return deleted_count, error_count, freed_bytes
 
 
+def _normalize_path(path: str) -> str:
+    """Normalize forward-slash UNC paths to backslash for Windows APIs.
+
+    The DB stores paths like ``//server/share/dir/file.jpg`` but Windows shell
+    APIs (including send2trash) expect ``\\\\server\\share\\dir\\file.jpg``.
+    """
+    return str(Path(path).resolve())
+
+
 def _trash_file(path: str) -> None:
     from send2trash import send2trash
 
-    send2trash(path)
+    send2trash(_normalize_path(path))
 
 
 def _hard_delete_file(path: str) -> None:
-    Path(path).unlink()
+    Path(path).resolve().unlink()
