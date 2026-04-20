@@ -307,3 +307,122 @@ def test_execute_moves_is_idempotent(db, tmp_dir):
     decisions2, skipped2 = plan_moves(db, dest_root)
     assert decisions2 == []
     assert skipped2 == 0
+
+
+# --- Exclude-source filtering ---
+
+
+def test_plan_moves_excludes_given_prefixes(db, tmp_dir):
+    """exclude_sources=[prefix] drops every row whose path starts with prefix."""
+    keep = tmp_dir / "keepers"
+    drop = tmp_dir / "dropme"
+    keep.mkdir()
+    drop.mkdir()
+
+    for folder, name in [(keep, "a.jpg"), (keep, "b.jpg"), (drop, "c.jpg"), (drop, "d.jpg")]:
+        p = folder / name
+        p.write_bytes(b"x")
+        db.insert_image(
+            normalize_path(p), name, 1,
+            exif_date="2020:01:01 00:00:00",
+        )
+    db.conn.commit()
+
+    decisions, _ = plan_moves(
+        db, tmp_dir / "archive",
+        exclude_sources=[str(drop)],
+    )
+
+    assert len(decisions) == 2
+    srcs = {Path(d.src_path).name for d in decisions}
+    assert srcs == {"a.jpg", "b.jpg"}
+
+
+def test_plan_moves_exclude_respects_directory_boundary(db, tmp_dir):
+    """--exclude-source foo must not also match foo_bar/... (prefix sibling)."""
+    foo = tmp_dir / "foo"
+    foobar = tmp_dir / "foo_bar"
+    foo.mkdir()
+    foobar.mkdir()
+
+    in_foo = foo / "a.jpg"
+    in_foo.write_bytes(b"x")
+    in_foobar = foobar / "b.jpg"
+    in_foobar.write_bytes(b"x")
+
+    db.insert_image(normalize_path(in_foo), "a.jpg", 1, exif_date="2020:01:01 00:00:00")
+    db.insert_image(normalize_path(in_foobar), "b.jpg", 1, exif_date="2020:01:01 00:00:00")
+    db.conn.commit()
+
+    decisions, _ = plan_moves(
+        db, tmp_dir / "archive",
+        exclude_sources=[str(foo)],
+    )
+
+    # Only the foo/ row is excluded; foo_bar/ survives.
+    assert len(decisions) == 1
+    assert Path(decisions[0].src_path).name == "b.jpg"
+
+
+def test_plan_moves_empty_exclude_list_is_noop(db, tmp_dir):
+    src = tmp_dir / "a.jpg"
+    src.write_bytes(b"x")
+    db.insert_image(normalize_path(src), "a.jpg", 1, exif_date="2020:01:01 00:00:00")
+    db.conn.commit()
+
+    decisions, _ = plan_moves(db, tmp_dir / "archive", exclude_sources=[])
+    assert len(decisions) == 1
+
+
+# --- Keyboard interrupt handling ---
+
+
+def test_execute_moves_commits_pending_batch_on_interrupt(db, tmp_dir, monkeypatch):
+    """Ctrl+C mid-loop must still persist updates for already-moved files.
+
+    Regression guard for the batch-loss bug: prior to the try/finally wrap,
+    interrupts would roll back up to 499 uncommitted path updates, leaving
+    files moved on disk but DB pointing at their old locations.
+    """
+    import pytest
+
+    from dedup import organizer
+
+    # Three sources; we'll interrupt on the 3rd shutil.move.
+    srcs = []
+    for i in range(3):
+        p = tmp_dir / f"src{i}.jpg"
+        p.write_bytes(b"x")
+        srcs.append(p)
+        db.insert_image(
+            normalize_path(p), p.name, 1,
+            exif_date=f"2020:01:0{i + 1} 00:00:00",
+        )
+    db.conn.commit()
+
+    dest_root = tmp_dir / "archive"
+    decisions, _ = plan_moves(db, dest_root)
+    assert len(decisions) == 3
+
+    original_move = organizer.shutil.move
+    call_count = {"n": 0}
+
+    def flaky_move(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 3:
+            raise KeyboardInterrupt()
+        return original_move(*args, **kwargs)
+
+    monkeypatch.setattr(organizer.shutil, "move", flaky_move)
+
+    with pytest.raises(KeyboardInterrupt):
+        execute_moves(db, decisions, Console())
+
+    # After interrupt + finally commit, the first two rows' paths should
+    # reflect the new archive location; the third should still be the source.
+    rows = db.conn.execute(
+        "SELECT id, path FROM images ORDER BY id"
+    ).fetchall()
+    assert "archive/2020" in rows[0]["path"]
+    assert "archive/2020" in rows[1]["path"]
+    assert "archive/2020" not in rows[2]["path"]

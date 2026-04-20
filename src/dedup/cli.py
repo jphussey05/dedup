@@ -221,6 +221,15 @@ def organize(
     limit: int | None = typer.Option(
         None, help="Only process the first N images (useful for testing)"
     ),
+    exclude_source: list[str] = typer.Option(
+        [],
+        "--exclude-source",
+        help=(
+            "Source path prefix to skip; repeatable. Any row whose current "
+            "path starts with this prefix is left where it is. Example: "
+            "--exclude-source '//hussey_nas/hussey share/whitney pro photos'"
+        ),
+    ),
 ) -> None:
     """Rename & move surviving images into dest/YYYY/YYYY-MM-DD_HHMMSS.ext.
 
@@ -242,7 +251,11 @@ def organize(
             )
 
         dest_root = Path(dest)
-        decisions, skipped = plan_moves(database, dest_root, limit, console=console)
+        decisions, skipped = plan_moves(
+            database, dest_root, limit,
+            console=console,
+            exclude_sources=exclude_source,
+        )
 
         if not decisions and not skipped:
             console.print("[dim]No surviving images to organize.[/dim]")

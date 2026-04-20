@@ -141,15 +141,39 @@ def _already_at_dest(src_db_path: str, dest_native: Path) -> bool:
     return normalize_path(str(dest_native)) == src_db_path
 
 
+def _normalize_exclude_prefixes(exclude_sources: list[str] | None) -> list[str]:
+    """Turn user-supplied exclude paths into DB-canonical prefix strings.
+
+    The DB stores paths via ``normalize_path`` (forward slash, lowercased on
+    Windows). We match the same way, and append a trailing ``/`` so the prefix
+    test respects directory boundaries — ``a/b`` excludes ``a/b/x`` but not
+    ``a/bcd``.
+    """
+    if not exclude_sources:
+        return []
+    out: list[str] = []
+    for s in exclude_sources:
+        norm = normalize_path(s).rstrip("/")
+        if norm:
+            out.append(norm + "/")
+    return out
+
+
 def plan_moves(
     db: Database,
     dest_root: Path,
     limit: int | None = None,
     console: Console | None = None,
+    exclude_sources: list[str] | None = None,
 ) -> tuple[list[MoveDecision], int]:
     """Build a MoveDecision for every surviving image that has a usable date.
 
     Returns (decisions, skipped_no_date).
+
+    ``exclude_sources`` is a list of path prefixes; any row whose current path
+    starts with one of them is left alone. This is the blacklist equivalent of
+    choosing scan scope after the fact — useful for folders you never want
+    reorganized (backups, external-drive mirrors, non-photo archives).
 
     For large DBs (100k+ rows) the planning phase was previously silent and
     looked like a hang — this now snapshots the destination once, then streams
@@ -158,8 +182,21 @@ def plan_moves(
     if console is None:
         console = Console()
 
+    excludes = _normalize_exclude_prefixes(exclude_sources)
+
     with console.status("[bold]Loading surviving images from DB[/bold]"):
         rows = db.get_surviving_images()
+
+    if excludes:
+        before = len(rows)
+        rows = [r for r in rows if not any(r["path"].startswith(e) for e in excludes)]
+        skipped_excluded = before - len(rows)
+        if skipped_excluded:
+            console.print(
+                f"[dim]Excluded {skipped_excluded:,} row(s) under "
+                f"{len(excludes)} blacklisted prefix(es).[/dim]"
+            )
+
     if limit is not None:
         rows = rows[:limit]
 
@@ -302,42 +339,58 @@ def execute_moves(
     """Actually move files and update DB paths.
 
     Returns (moved_count, error_count).
+
+    Ctrl+C is handled cleanly: the pending DB batch is committed in a
+    ``finally`` so path updates for already-moved files aren't rolled back.
+    Without this guard, up to ~499 files could end up moved on disk but
+    still pointing at their old path in the DB — a subtle and expensive
+    inconsistency to clean up later.
     """
     moved = 0
     errors = 0
     batch_since_commit = 0
 
-    with Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-    ) as progress:
-        task = progress.add_task("Moving", total=len(decisions))
-        for d in decisions:
-            src_native = _denormalize(d.src_path)
-            dest_native = d.dest_path
-            try:
-                Path(dest_native).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(src_native, dest_native)
+    try:
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+        ) as progress:
+            task = progress.add_task("Moving", total=len(decisions))
+            for d in decisions:
+                src_native = _denormalize(d.src_path)
+                dest_native = d.dest_path
+                try:
+                    Path(dest_native).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(src_native, dest_native)
 
-                # Same defensive check we use in the deleter: shell APIs can
-                # "succeed" on mangled paths without doing anything.
-                if not Path(dest_native).exists():
-                    raise OSError(f"move reported OK but destination missing: {dest_native}")
-                if Path(src_native).exists():
-                    raise OSError(f"move reported OK but source still present: {src_native}")
+                    # Same defensive check we use in the deleter: shell APIs can
+                    # "succeed" on mangled paths without doing anything.
+                    if not Path(dest_native).exists():
+                        raise OSError(f"move reported OK but destination missing: {dest_native}")
+                    if Path(src_native).exists():
+                        raise OSError(f"move reported OK but source still present: {src_native}")
 
-                db.update_path(d.image_id, normalize_path(dest_native))
-                moved += 1
-                batch_since_commit += 1
-                if batch_since_commit >= 500:
-                    db.conn.commit()
-                    batch_since_commit = 0
-            except Exception as exc:
-                errors += 1
-                console.print(f"[red]Failed:[/red] {d.src_path} → {d.dest_path} ({exc})")
-            progress.advance(task)
+                    db.update_path(d.image_id, normalize_path(dest_native))
+                    moved += 1
+                    batch_since_commit += 1
+                    if batch_since_commit >= 500:
+                        db.conn.commit()
+                        batch_since_commit = 0
+                except Exception as exc:
+                    errors += 1
+                    console.print(f"[red]Failed:[/red] {d.src_path} → {d.dest_path} ({exc})")
+                progress.advance(task)
+    except KeyboardInterrupt:
+        console.print(
+            f"\n[yellow]Interrupted at {moved}/{len(decisions)} — "
+            "committing pending DB updates before exit.[/yellow]"
+        )
+        raise
+    finally:
+        # Always commit — interrupts and exceptions should not roll back the
+        # path updates for files already moved on disk.
+        db.conn.commit()
+        db.checkpoint()
 
-    db.conn.commit()
-    db.checkpoint()
     return moved, errors
