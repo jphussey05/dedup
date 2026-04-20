@@ -77,10 +77,11 @@ def _build_dest(
 ) -> Path:
     """Compose ``dest_root/YYYY/YYYY-MM-DD_HHMMSS.ext``, suffixing on collision.
 
-    `taken` tracks destinations already claimed in this planning pass so two
-    sources that share a timestamp don't target the same file. Existing files
-    on disk are also treated as occupied (protects against clobbering unrelated
-    content left behind by a prior run).
+    `taken` is authoritative: it should already contain every path that exists
+    on disk under ``dest_root`` (seeded by ``_snapshot_dest``) plus every
+    destination reserved earlier in this planning pass. We deliberately do NOT
+    call ``candidate.exists()`` here — for large UNC runs that's one SMB stat
+    per image, which dwarfs the actual work.
     """
     candidate = _natural_dest(dt, ext, dest_root)
     stem_base = candidate.stem
@@ -88,10 +89,38 @@ def _build_dest(
     year_dir = candidate.parent
 
     suffix = 0
-    while candidate in taken or candidate.exists():
+    while candidate in taken:
         suffix += 1
         candidate = year_dir / f"{stem_base}_{suffix:03d}{ext_norm}"
     return candidate
+
+
+def _snapshot_dest(dest_root: Path) -> set[Path]:
+    """One-shot listing of every file already under ``dest_root/YYYY/``.
+
+    Planning previously called ``Path(candidate).exists()`` per image — fine
+    locally, catastrophic over SMB (one network round-trip per survivor). This
+    turns N stats into ~K directory listings where K = number of year folders,
+    which on a fresh archive means one ``iterdir`` on ``dest_root`` itself.
+    """
+    occupied: set[Path] = set()
+    try:
+        if not dest_root.exists():
+            return occupied
+        for year_dir in dest_root.iterdir():
+            if not year_dir.is_dir():
+                continue
+            try:
+                for f in year_dir.iterdir():
+                    if f.is_file():
+                        occupied.add(f)
+            except OSError:
+                continue
+    except OSError:
+        # Unreachable dest (offline NAS, permission error) — treat as empty.
+        # The subsequent mkdir during execute will raise the real error.
+        pass
+    return occupied
 
 
 def _denormalize(db_path: str) -> str:
@@ -116,46 +145,71 @@ def plan_moves(
     db: Database,
     dest_root: Path,
     limit: int | None = None,
+    console: Console | None = None,
 ) -> tuple[list[MoveDecision], int]:
     """Build a MoveDecision for every surviving image that has a usable date.
 
     Returns (decisions, skipped_no_date).
+
+    For large DBs (100k+ rows) the planning phase was previously silent and
+    looked like a hang — this now snapshots the destination once, then streams
+    the row loop through a visible progress bar.
     """
-    rows = db.get_surviving_images()
+    if console is None:
+        console = Console()
+
+    with console.status("[bold]Loading surviving images from DB[/bold]"):
+        rows = db.get_surviving_images()
     if limit is not None:
         rows = rows[:limit]
 
+    if not rows:
+        return [], 0
+
+    with console.status(f"[bold]Snapshotting {dest_root}[/bold] (one-shot listing)"):
+        taken = _snapshot_dest(dest_root)
+
     decisions: list[MoveDecision] = []
-    taken: set[Path] = set()
     skipped_no_date = 0
 
-    for row in rows:
-        dt, source = _parse_date(row["exif_date"], row["file_mtime"])
-        if dt is None:
-            skipped_no_date += 1
-            continue
+    with Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Planning", total=len(rows))
+        for row in rows:
+            dt, source = _parse_date(row["exif_date"], row["file_mtime"])
+            if dt is None:
+                skipped_no_date += 1
+                progress.advance(task)
+                continue
 
-        ext = Path(row["filename"] or row["path"]).suffix or ".jpg"
+            ext = Path(row["filename"] or row["path"]).suffix or ".jpg"
 
-        # Idempotency check: compare to the UNSUFFIXED destination. If the row's
-        # current path already matches the canonical name, there's nothing to do —
-        # without this guard, _build_dest would see the file on disk (our own!)
-        # and falsely bump to _001.
-        if _already_at_dest(row["path"], _natural_dest(dt, ext, dest_root)):
-            continue
+            # Idempotency check: compare to the UNSUFFIXED destination. If the
+            # row's current path already matches the canonical name, nothing to
+            # do — without this guard, _build_dest would see our own file in
+            # the occupied set and falsely bump to _001.
+            natural = _natural_dest(dt, ext, dest_root)
+            if _already_at_dest(row["path"], natural):
+                progress.advance(task)
+                continue
 
-        dest = _build_dest(dt, ext, dest_root, taken)
-        taken.add(dest)
-        decisions.append(
-            MoveDecision(
-                image_id=row["id"],
-                src_path=row["path"],
-                dest_path=str(dest),
-                date_source=source,
-                dest_year=f"{dt.year:04d}",
-                file_size=row["file_size"] or 0,
+            dest = _build_dest(dt, ext, dest_root, taken)
+            taken.add(dest)
+            decisions.append(
+                MoveDecision(
+                    image_id=row["id"],
+                    src_path=row["path"],
+                    dest_path=str(dest),
+                    date_source=source,
+                    dest_year=f"{dt.year:04d}",
+                    file_size=row["file_size"] or 0,
+                )
             )
-        )
+            progress.advance(task)
 
     return decisions, skipped_no_date
 

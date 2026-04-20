@@ -73,15 +73,36 @@ def test_build_dest_collision_suffix(tmp_dir):
     assert d3.name == "2021-05-10_123456_002.jpg"
 
 
-def test_build_dest_respects_existing_file_on_disk(tmp_dir):
-    """A file already on disk at the target should bump the new dest to _001."""
+def test_build_dest_respects_occupied_set(tmp_dir):
+    """Pre-seeded `taken` entries (the on-disk snapshot) should force a suffix bump."""
+    dt = datetime(2021, 5, 10, 12, 34, 56)
+    occupied: set[Path] = {tmp_dir / "2021" / "2021-05-10_123456.jpg"}
+    dest = _build_dest(dt, ".jpg", tmp_dir, taken=occupied)
+    assert dest.name == "2021-05-10_123456_001.jpg"
+
+
+def test_snapshot_dest_picks_up_existing_files(tmp_dir):
+    """_snapshot_dest returns every file in every YYYY/ subdir — no stat per image needed."""
+    from dedup.organizer import _snapshot_dest
+
     year_dir = tmp_dir / "2021"
     year_dir.mkdir()
-    (year_dir / "2021-05-10_123456.jpg").write_bytes(b"x")
+    (year_dir / "a.jpg").write_bytes(b"x")
+    (year_dir / "b.jpg").write_bytes(b"x")
+    (tmp_dir / "2022").mkdir()
+    (tmp_dir / "2022" / "c.jpg").write_bytes(b"x")
 
-    dt = datetime(2021, 5, 10, 12, 34, 56)
-    dest = _build_dest(dt, ".jpg", tmp_dir, taken=set())
-    assert dest.name == "2021-05-10_123456_001.jpg"
+    snap = _snapshot_dest(tmp_dir)
+    assert snap == {
+        year_dir / "a.jpg",
+        year_dir / "b.jpg",
+        tmp_dir / "2022" / "c.jpg",
+    }
+
+
+def test_snapshot_dest_on_missing_root_returns_empty(tmp_dir):
+    from dedup.organizer import _snapshot_dest
+    assert _snapshot_dest(tmp_dir / "does_not_exist") == set()
 
 
 def test_build_dest_lowercases_extension(tmp_dir):

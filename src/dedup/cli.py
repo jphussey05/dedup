@@ -242,7 +242,7 @@ def organize(
             )
 
         dest_root = Path(dest)
-        decisions, skipped = plan_moves(database, dest_root, limit)
+        decisions, skipped = plan_moves(database, dest_root, limit, console=console)
 
         if not decisions and not skipped:
             console.print("[dim]No surviving images to organize.[/dim]")
