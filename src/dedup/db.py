@@ -323,6 +323,26 @@ class Database:
             (group_id,),
         ).fetchall()
 
+    def get_surviving_images(self) -> list[sqlite3.Row]:
+        """Every image the DB still knows about, excluding rows marked errored.
+
+        Used by the organize command to plan moves for all kept files.
+        """
+        return self.conn.execute(
+            """SELECT id, path, filename, file_size, exif_date, file_mtime
+               FROM images WHERE error IS NULL ORDER BY id"""
+        ).fetchall()
+
+    def update_path(self, image_id: int, new_path: str) -> None:
+        """Update the stored path after moving a file on disk.
+
+        `path` has a UNIQUE constraint, so a collision here raises IntegrityError
+        rather than silently overwriting another row.
+        """
+        self.conn.execute(
+            "UPDATE images SET path = ? WHERE id = ?", (new_path, image_id)
+        )
+
     def delete_images(self, image_ids: list[int]) -> None:
         """Remove image rows by id. Pairs cascade; groups cleaned up separately."""
         if not image_ids:

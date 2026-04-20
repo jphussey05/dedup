@@ -202,6 +202,88 @@ def review(
 
 
 @app.command()
+def organize(
+    db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
+    dest: str = typer.Option(
+        "//hussey_nas/hussey share/photos_organized",
+        "--dest",
+        help="Destination root for the consolidated archive",
+    ),
+    execute: bool = typer.Option(
+        False, "--execute", help="Actually move files (otherwise preview only)"
+    ),
+    export: Path | None = typer.Option(
+        None, "--export", "-o", help="Write move plan to CSV"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip confirmation prompt when executing"
+    ),
+    limit: int | None = typer.Option(
+        None, help="Only process the first N images (useful for testing)"
+    ),
+) -> None:
+    """Rename & move surviving images into dest/YYYY/YYYY-MM-DD_HHMMSS.ext.
+
+    Run this AFTER ``dedup review --execute`` has removed duplicates. Uses EXIF
+    DateTimeOriginal when available, falls back to file mtime. Preview-only
+    unless --execute is passed.
+    """
+    from dedup.organizer import execute_moves, export_plan, plan_moves, preview_moves
+
+    database = get_db(db)
+    try:
+        # Heads-up: if there are unresolved exact duplicate groups, the user
+        # almost certainly wants to run `review --execute` first.
+        remaining = database.get_duplicate_groups("exact")
+        if remaining:
+            console.print(
+                f"[yellow]Warning:[/yellow] {len(remaining)} unresolved exact duplicate "
+                "groups still in DB. Consider running [bold]dedup review --execute[/bold] first."
+            )
+
+        dest_root = Path(dest)
+        decisions, skipped = plan_moves(database, dest_root, limit)
+
+        if not decisions and not skipped:
+            console.print("[dim]No surviving images to organize.[/dim]")
+            return
+
+        preview_moves(decisions, console, skipped_no_date=skipped)
+
+        if export:
+            export_plan(decisions, export)
+            console.print(f"[green]Wrote move plan to {export}[/green]")
+
+        if not decisions:
+            return
+
+        if not execute:
+            console.print(
+                "\n[dim]Preview only. Re-run with [bold]--execute[/bold] to move.[/dim]"
+            )
+            return
+
+        console.print(
+            f"\nAbout to move [bold]{len(decisions)}[/bold] files into "
+            f"[bold]{dest_root}[/bold]."
+        )
+
+        if not yes:
+            confirm = typer.confirm("Proceed?", default=False)
+            if not confirm:
+                console.print("[yellow]Aborted.[/yellow]")
+                return
+
+        moved, errs = execute_moves(database, decisions, console)
+        console.print(
+            f"[green]Moved {moved} files[/green]"
+            f"{f', [red]{errs} errors[/red]' if errs else ''}"
+        )
+    finally:
+        database.close()
+
+
+@app.command()
 def errors(
     db: Path = typer.Option(Path("dedup.db"), "--db", help="SQLite database path"),
     limit: int = typer.Option(50, help="Max errors to show"),
